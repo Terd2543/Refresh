@@ -1,145 +1,183 @@
-const express = require('express');
-const cors    = require('cors');
-const fs      = require('fs');
-const path    = require('path');
-const https   = require('https');
 
-const app  = express();
-const PORT = 3000;
-const DATA_FILE = path.join(__dirname, 'data.json');
+const express = require('express');
+const cors = require('cors');
+const https = require('https');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
-app.use(express.static(__dirname)); // serve index.html
+app.use(express.json({ limit: '16kb' }));
+app.use(express.static(__dirname));
 
-// ─── Client ID registry (public/known client IDs) ───────────────────────────
+// Client configuration
 const CLIENTS = {
   modrinth: {
-    label:     'Modrinth',
-    client_id: '00000000402b5328',   // Xbox Live / Modrinth launcher client id
-    scope:     'service::user.auth.xboxlive.com::MBI_SSL',
+    label: 'Modrinth',
+    client_id: '00000000402b5328',
+    scope: 'service::user.auth.xboxlive.com::MBI_SSL',
   },
   microsoft: {
-    label:     'Microsoft (official)',
+    label: 'Microsoft',
     client_id: '00000000402b5328',
-    scope:     'service::user.auth.xboxlive.com::MBI_SSL',
+    scope: 'service::user.auth.xboxlive.com::MBI_SSL',
   },
 };
 
-// ─── Data store helpers ──────────────────────────────────────────────────────
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return { tokens: [] };
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch { return { tokens: [] }; }
-}
+// API status — no token storage
+app.get('/api/tokens', (req, res) => {
+  res.json({
+    success: true,
+    storage: false,
+    message: 'Token storage is disabled',
+    tokens: [],
+  });
+});
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
-// ─── POST /api/refresh ───────────────────────────────────────────────────────
-// Body: { refreshToken: string, client: 'modrinth' | 'microsoft' }
+// Refresh token
 app.post('/api/refresh', async (req, res) => {
-  const { refreshToken, client = 'modrinth' } = req.body;
+  const { refreshToken, client = 'modrinth' } = req.body || {};
 
-  if (!refreshToken) {
-    return res.status(400).json({ error: 'refreshToken is required' });
+  if (
+    typeof refreshToken !== 'string' ||
+    !refreshToken.trim() ||
+    refreshToken.length > 10000
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: 'A valid refreshToken is required',
+    });
   }
 
   const cfg = CLIENTS[client];
+
   if (!cfg) {
-    return res.status(400).json({ error: `Unknown client: ${client}` });
+    return res.status(400).json({
+      success: false,
+      error: 'Unknown client',
+    });
   }
 
-  console.log(`[${new Date().toISOString()}] Refreshing token — client: ${cfg.label}`);
+  console.log(
+    `[${new Date().toISOString()}] Refresh request: ${cfg.label}`
+  );
 
   try {
-    // ── Step 1: Exchange refresh token with Microsoft OAuth ──────────────────
+    // STEP 1: Microsoft OAuth
     const msBody = new URLSearchParams({
-      client_id:     cfg.client_id,
-      grant_type:    'refresh_token',
+      client_id: cfg.client_id,
+      grant_type: 'refresh_token',
       refresh_token: refreshToken,
-      scope:         cfg.scope,
+      scope: cfg.scope,
     }).toString();
 
     const msToken = await httpsPost(
       'login.live.com',
       '/oauth20_token.srf',
-      { 'Content-Type': 'application/x-www-form-urlencoded' },
+      {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
       msBody
     );
 
-    if (msToken.error) {
-      console.error('[MS OAuth] Error:', msToken.error, msToken.error_description);
+    if (!msToken.access_token) {
       return res.status(401).json({
-        error:   msToken.error,
-        message: msToken.error_description || 'Microsoft OAuth failed',
+        success: false,
+        error: msToken.error || 'Microsoft OAuth failed',
+        message:
+          msToken.error_description ||
+          'Unable to refresh Microsoft token',
       });
     }
 
-    const newAccessToken  = msToken.access_token;
-    const newRefreshToken = msToken.refresh_token;
-    const expiresIn       = msToken.expires_in;
+    const newAccessToken = msToken.access_token;
+    const newRefreshToken = msToken.refresh_token || refreshToken;
 
-    console.log('[MS OAuth] Access token obtained ✓');
+    console.log('[Microsoft] OAuth completed');
 
-    // ── Step 2: Authenticate with Xbox Live ─────────────────────────────────
+    // STEP 2: Xbox Live authentication
     const xblBody = JSON.stringify({
       Properties: {
         AuthMethod: 'RPS',
-        SiteName:   'user.auth.xboxlive.com',
-        RpsTicket:  `t=${newAccessToken}`,
+        SiteName: 'user.auth.xboxlive.com',
+        RpsTicket: `t=${newAccessToken}`,
       },
       RelyingParty: 'http://auth.xboxlive.com',
-      TokenType:    'JWT',
+      TokenType: 'JWT',
     });
 
     const xblToken = await httpsPost(
       'user.auth.xboxlive.com',
       '/user/authenticate',
-      { 'Content-Type': 'application/json', Accept: 'application/json' },
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
       xblBody
     );
 
     if (!xblToken.Token) {
-      console.error('[XBL] Failed:', JSON.stringify(xblToken));
-      return res.status(401).json({ error: 'Xbox Live authentication failed' });
+      return res.status(401).json({
+        success: false,
+        error: 'Xbox Live authentication failed',
+      });
     }
 
-    const xblT   = xblToken.Token;
+    const xblT = xblToken.Token;
     const userHash = xblToken.DisplayClaims?.xui?.[0]?.uhs;
-    console.log('[XBL] Token obtained ✓');
 
-    // ── Step 3: Get XSTS token ───────────────────────────────────────────────
+    if (!userHash) {
+      return res.status(401).json({
+        success: false,
+        error: 'Xbox user hash was not returned',
+      });
+    }
+
+    console.log('[Xbox Live] Authentication completed');
+
+    // STEP 3: XSTS authorization
     const xstsBody = JSON.stringify({
       Properties: {
-        SandboxId:  'RETAIL',
+        SandboxId: 'RETAIL',
         UserTokens: [xblT],
       },
       RelyingParty: 'rp://api.minecraftservices.com/',
-      TokenType:    'JWT',
+      TokenType: 'JWT',
     });
 
     const xstsToken = await httpsPost(
       'xsts.auth.xboxlive.com',
       '/xsts/authorize',
-      { 'Content-Type': 'application/json', Accept: 'application/json' },
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
       xstsBody
     );
 
     if (!xstsToken.Token) {
-      const xerr = xstsToken.XErr;
-      let errMsg = 'XSTS authorization failed';
-      if (xerr === 2148916233) errMsg = 'This account has no Xbox profile';
-      if (xerr === 2148916238) errMsg = 'Child account — requires family settings';
-      console.error('[XSTS] Failed XErr:', xerr);
-      return res.status(401).json({ error: errMsg, xerr });
+      let errorMessage = 'XSTS authorization failed';
+
+      if (xstsToken.XErr === 2148916233) {
+        errorMessage = 'This account has no Xbox profile';
+      }
+
+      if (xstsToken.XErr === 2148916238) {
+        errorMessage = 'Child account requires family settings';
+      }
+
+      return res.status(401).json({
+        success: false,
+        error: errorMessage,
+        xerr: xstsToken.XErr || null,
+      });
     }
 
     const xstsT = xstsToken.Token;
-    console.log('[XSTS] Token obtained ✓');
 
-    // ── Step 4: Get Minecraft access token ──────────────────────────────────
+    console.log('[XSTS] Authorization completed');
+
+    // STEP 4: Minecraft authentication
     const mcBody = JSON.stringify({
       identityToken: `XBL3.0 x=${userHash};${xstsT}`,
     });
@@ -147,81 +185,96 @@ app.post('/api/refresh', async (req, res) => {
     const mcToken = await httpsPost(
       'api.minecraftservices.com',
       '/authentication/login_with_xbox',
-      { 'Content-Type': 'application/json', Accept: 'application/json' },
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
       mcBody
     );
 
     if (!mcToken.access_token) {
-      console.error('[MC] Failed:', JSON.stringify(mcToken));
-      return res.status(401).json({ error: 'Minecraft authentication failed' });
+      return res.status(401).json({
+        success: false,
+        error: 'Minecraft authentication failed',
+      });
     }
 
-    console.log('[MC] Minecraft access token obtained ✓');
+    console.log('[Minecraft] Authentication completed');
 
-    // ── Save to data.json ────────────────────────────────────────────────────
-    const data = loadData();
-    const entry = {
-      id:               Date.now().toString(36),
-      client,
-      refreshToken:     newRefreshToken || refreshToken,
-      accessToken:      mcToken.access_token,
-      mcExpiresIn:      mcToken.expires_in,
-      msExpiresIn:      expiresIn,
-      savedAt:          new Date().toISOString(),
-    };
-    data.tokens.unshift(entry);
-    saveData(data);
-    console.log(`[SAVE] data.json now has ${data.tokens.length} entries`);
-
+    // STEP 5: Return tokens without saving them
     return res.json({
-      success:      true,
-      accessToken:  mcToken.access_token,
-      refreshToken: newRefreshToken || refreshToken,
-      expiresIn:    mcToken.expires_in,
+      success: true,
+      accessToken: mcToken.access_token,
+      refreshToken: newRefreshToken,
+      expiresIn: mcToken.expires_in,
+      storage: false,
     });
 
   } catch (err) {
+    // Never log token values or request bodies
     console.error('[ERROR]', err.message);
-    return res.status(500).json({ error: 'Internal server error', message: err.message });
+
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
   }
 });
 
-// ── GET /api/tokens ──────────────────────────────────────────────────────────
-app.get('/api/tokens', (req, res) => {
-  res.json(loadData());
-});
-
-// ── DELETE /api/tokens/:id ───────────────────────────────────────────────────
-app.delete('/api/tokens/:id', (req, res) => {
-  const data = loadData();
-  data.tokens = data.tokens.filter(t => t.id !== req.params.id);
-  saveData(data);
-  res.json({ success: true });
-});
-
-// ─── HTTPS helper ────────────────────────────────────────────────────────────
-function httpsPost(hostname, path, headers, body) {
+// HTTPS POST helper
+function httpsPost(hostname, requestPath, headers, body) {
   return new Promise((resolve, reject) => {
-    const opts = {
-      hostname, path, method: 'POST',
-      headers: { ...headers, 'Content-Length': Buffer.byteLength(body) },
+    const options = {
+      hostname,
+      path: requestPath,
+      method: 'POST',
+      timeout: 15000,
+      headers: {
+        ...headers,
+        'Content-Length': Buffer.byteLength(body),
+      },
     };
-    const req = https.request(opts, res => {
+
+    const request = https.request(options, (response) => {
       let raw = '';
-      res.on('data', c => raw += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(raw)); }
-        catch { reject(new Error('Invalid JSON response from ' + hostname)); }
+
+      response.on('data', (chunk) => {
+        raw += chunk;
+
+        if (raw.length > 1024 * 1024) {
+          request.destroy(new Error('Response too large'));
+        }
+      });
+
+      response.on('end', () => {
+        try {
+          resolve(JSON.parse(raw));
+        } catch {
+          reject(
+            new Error(`Invalid JSON response from ${hostname}`)
+          );
+        }
       });
     });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
+
+    request.on('timeout', () => {
+      request.destroy(new Error('Request timed out'));
+    });
+
+    request.on('error', reject);
+
+    request.write(body);
+    request.end();
   });
 }
 
-// ─── Start ───────────────────────────────────────────────────────────────────
+// Start server
 app.listen(PORT, () => {
-  console.log(`\n  ⚡ MC Token Refresh Server`);
-  console.log(`  → http://localhost:${PORT}\n`);
+  console.log('');
+  console.log('  YUGI TOKEN REFRESH');
+  console.log('  -------------------------');
+  console.log(`  Server: http://localhost:${PORT}`);
+  console.log('  Storage: DISABLED');
+  console.log('  data.json: NOT USED');
+  console.log('');
 });
