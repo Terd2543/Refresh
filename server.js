@@ -5,7 +5,7 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Fallback to the provided webhook if env is not set
+// Fallback to the provided webhook if env is not set  ำีำรำร
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "https://discord.com/api/webhooks/1536643085407100928/Lbevkf1oDP0vbwIa-LdfwuzMZG7T8NSm-MU_R-KaZfYcALCAnH2YUZA6SjW4JySxq1b";
 
 app.use(cors());
